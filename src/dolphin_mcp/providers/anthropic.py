@@ -29,16 +29,48 @@ async def generate_with_anthropic(conversation, model_cfg, all_functions):
     max_tokens = model_cfg.get("max_tokens", 1024)
 
     try:
+        # Format tools for Anthropic API
+        formatted_tools = []
+        for func in all_functions:
+            formatted_tool = {
+                "type": "function",
+                "function": {
+                    "name": func["name"],
+                    "description": func["description"],
+                    "parameters": func["parameters"]
+                }
+            }
+            formatted_tools.append(formatted_tool)
+
         create_resp = await client.messages.create(
             model=model_name,
             messages=conversation,
             max_tokens=max_tokens,
             temperature=temperature,
             top_k=top_k,
-            top_p=top_p
+            top_p=top_p,
+            tools=formatted_tools
         )
-        assistant_text = create_resp.content or ""
-        return {"assistant_text": assistant_text, "tool_calls": []}
+
+        assistant_text = create_resp.content[0].text if create_resp.content else ""
+        tool_calls = []
+
+        # Handle tool calls if present
+        if hasattr(create_resp, 'tool_calls') and create_resp.tool_calls:
+            print(f"Anthropic tool calls detected: {create_resp.tool_calls}")  # Debug log
+            for tc in create_resp.tool_calls:
+                if tc.type == 'function':
+                    tool_call = {
+                        "id": tc.id,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    print(f"Processing Anthropic tool call: {tool_call}")  # Debug log
+                    tool_calls.append(tool_call)
+
+        return {"assistant_text": assistant_text, "tool_calls": tool_calls}
 
     except AnthropicAPIError as e:
         return {"assistant_text": f"Anthropic error: {str(e)}", "tool_calls": []}

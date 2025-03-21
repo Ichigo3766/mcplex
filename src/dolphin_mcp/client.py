@@ -13,247 +13,74 @@ from .utils import load_mcp_config_from_file
 from .providers.openai import generate_with_openai
 from .providers.anthropic import generate_with_anthropic
 from .providers.ollama import generate_with_ollama
+from .connection_pool import MCPConnectionPool
+from .stream_processor import StreamProcessor
+from .mcp_client import MCPClient
+
+# Global instances
+_connection_pool = None
+_all_functions = None
+
+async def initialize_mcp(config: Optional[dict] = None, config_path: str = "mcp_config.json"):
+    """Initialize MCP servers and cache their tool definitions.
+    This should be called once when the application starts."""
+    global _connection_pool, _all_functions
+    
+    if _connection_pool is not None and _all_functions:
+        logger.info("MCP already initialized with %d tools", len(_all_functions))
+        return  # Already initialized with tools
+    
+    logger.info("Starting MCP initialization...")
+    
+    # Load or use provided config
+    if config is None:
+        logger.info("Loading config from %s", config_path)
+        config = await load_mcp_config_from_file(config_path)
+    servers_cfg = config.get("mcpServers", {})
+    logger.info("Found %d MCP servers in config", len(servers_cfg))
+    
+    # Initialize connection pool and tools list
+    _connection_pool = MCPConnectionPool(max_connections=10)
+    _all_functions = []
+    
+    # Get tool definitions from all servers
+    logger.info("Connecting to MCP servers and retrieving tool definitions...")
+    tasks = {}
+    for server_name, conf in servers_cfg.items():
+        client = await _connection_pool.get_connection(server_name, conf)
+        if client:
+            tasks[server_name] = client.list_tools()
+    
+    if tasks:
+        logger.info("Found %d servers to connect to", len(tasks))
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for server_name, tools in zip(tasks.keys(), results):
+            logger.info("Processing tools for server %s", server_name)
+            if isinstance(tools, Exception):
+                logger.error(f"Error getting tools for {server_name}: {str(tools)}")
+                continue
+            for t in tools:
+                input_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
+                fn_def = {
+                    "name": f"{server_name}_{t['name']}",
+                    "description": t.get("description", ""),
+                    "parameters": input_schema
+                }
+                _all_functions.append(fn_def)
+    
+    logger.info("MCP initialization complete. Registered %d tools", len(_all_functions))
+    if not _all_functions:
+        raise RuntimeError("No MCP servers could be started.")
+
+
+async def shutdown():
+    """Cleanup the global connection pool when application shuts down."""
+    global _connection_pool
+    if _connection_pool:
+        await _connection_pool.cleanup()
+        _connection_pool = None
 
 logger = logging.getLogger("dolphin_mcp")
-
-class MCPClient:
-    """Implementation for a single MCP server."""
-    def __init__(self, server_name, command, args=None, env=None):
-        self.server_name = server_name
-        self.command = command
-        self.args = args or []
-        self.env = env
-        self.process = None
-        self.tools = []
-        self.request_id = 0
-        self.protocol_version = "2024-11-05"
-        self.receive_task = None
-        self.responses = {}
-        self.server_capabilities = {}
-        self._shutdown = False
-        self._cleanup_lock = asyncio.Lock()
-
-    async def _receive_loop(self):
-        if not self.process or self.process.stdout.at_eof():
-            return
-        try:
-            while not self.process.stdout.at_eof():
-                line = await self.process.stdout.readline()
-                if not line:
-                    break
-                try:
-                    message = json.loads(line.decode().strip())
-                    self._process_message(message)
-                except json.JSONDecodeError:
-                    pass
-        except Exception:
-            pass
-
-    def _process_message(self, message: dict):
-        if "jsonrpc" in message and "id" in message:
-            if "result" in message or "error" in message:
-                self.responses[message["id"]] = message
-            else:
-                # request from server, not implemented
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": message["id"],
-                    "error": {
-                        "code": -32601,
-                        "message": f"Method {message.get('method')} not implemented in client"
-                    }
-                }
-                asyncio.create_task(self._send_message(resp))
-        elif "jsonrpc" in message and "method" in message and "id" not in message:
-            # notification from server
-            pass
-
-    async def start(self):
-        expanded_args = []
-        for a in self.args:
-            if isinstance(a, str) and "~" in a:
-                expanded_args.append(os.path.expanduser(a))
-            else:
-                expanded_args.append(a)
-
-        env_vars = os.environ.copy()
-        if self.env:
-            env_vars.update(self.env)
-
-        try:
-            self.process = await asyncio.create_subprocess_exec(
-                self.command,
-                *expanded_args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env_vars
-            )
-            self.receive_task = asyncio.create_task(self._receive_loop())
-            return await self._perform_initialize()
-        except Exception:
-            return False
-
-    async def _perform_initialize(self):
-        self.request_id += 1
-        req_id = self.request_id
-        req = {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": self.protocol_version,
-                "capabilities": {"sampling": {}},
-                "clientInfo": {
-                    "name": "DolphinMCPClient",
-                    "version": "1.0.0"
-                }
-            }
-        }
-        await self._send_message(req)
-
-        start = asyncio.get_event_loop().time()
-        timeout = 10  # Increased timeout to 10 seconds
-        while asyncio.get_event_loop().time() - start < timeout:
-            if req_id in self.responses:
-                resp = self.responses[req_id]
-                del self.responses[req_id]
-                if "error" in resp:
-                    logger.error(f"Server {self.server_name}: Initialize error: {resp['error']}")
-                    return False
-                if "result" in resp:
-                    elapsed = asyncio.get_event_loop().time() - start
-                    logger.info(f"Server {self.server_name}: Initialized in {elapsed:.2f}s")
-                    note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-                    await self._send_message(note)
-                    init_result = resp["result"]
-                    self.server_capabilities = init_result.get("capabilities", {})
-                    return True
-            await asyncio.sleep(0.05)
-        logger.error(f"Server {self.server_name}: Initialize timed out after {timeout}s")
-        return False
-
-    async def list_tools(self):
-        if not self.process:
-            return []
-        self.request_id += 1
-        rid = self.request_id
-        req = {
-            "jsonrpc": "2.0",
-            "id": rid,
-            "method": "tools/list",
-            "params": {}
-        }
-        await self._send_message(req)
-
-        start = asyncio.get_event_loop().time()
-        timeout = 10  # Increased timeout to 10 seconds
-        while asyncio.get_event_loop().time() - start < timeout:
-            if rid in self.responses:
-                resp = self.responses[rid]
-                del self.responses[rid]
-                if "error" in resp:
-                    logger.error(f"Server {self.server_name}: List tools error: {resp['error']}")
-                    return []
-                if "result" in resp and "tools" in resp["result"]:
-                    elapsed = asyncio.get_event_loop().time() - start
-                    logger.info(f"Server {self.server_name}: Listed {len(resp['result']['tools'])} tools in {elapsed:.2f}s")
-                    self.tools = resp["result"]["tools"]
-                    return self.tools
-            await asyncio.sleep(0.05)
-        logger.error(f"Server {self.server_name}: List tools timed out after {timeout}s")
-        return []
-
-    async def call_tool(self, tool_name: str, arguments: dict):
-        if not self.process:
-            return {"error": "Not started"}
-        self.request_id += 1
-        rid = self.request_id
-        req = {
-            "jsonrpc": "2.0",
-            "id": rid,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments
-            }
-        }
-        await self._send_message(req)
-
-        start = asyncio.get_event_loop().time()
-        timeout = 3600  # Increased timeout to 30 seconds
-        while asyncio.get_event_loop().time() - start < timeout:
-            if rid in self.responses:
-                resp = self.responses[rid]
-                del self.responses[rid]
-                if "error" in resp:
-                    logger.error(f"Server {self.server_name}: Tool {tool_name} error: {resp['error']}")
-                    return {"error": resp["error"]}
-                if "result" in resp:
-                    elapsed = asyncio.get_event_loop().time() - start
-                    logger.info(f"Server {self.server_name}: Tool {tool_name} completed in {elapsed:.2f}s")
-                    return resp["result"]
-            await asyncio.sleep(0.01)  # Reduced sleep interval for more responsive streaming
-            if asyncio.get_event_loop().time() - start > 5:  # Log warning after 5 seconds
-                logger.warning(f"Server {self.server_name}: Tool {tool_name} taking longer than 5s...")
-        logger.error(f"Server {self.server_name}: Tool {tool_name} timed out after {timeout}s")
-        return {"error": f"Timeout waiting for tool result after {timeout}s"}
-
-    async def _send_message(self, message: dict):
-        if not self.process or self._shutdown:
-            logger.error(f"Server {self.server_name}: Cannot send message - process not running or shutting down")
-            return False
-        try:
-            data = json.dumps(message) + "\n"
-            self.process.stdin.write(data.encode())
-            await self.process.stdin.drain()
-            return True
-        except Exception as e:
-            logger.error(f"Server {self.server_name}: Error sending message: {str(e)}")
-            return False
-
-    async def stop(self):
-        async with self._cleanup_lock:
-            if self._shutdown:
-                return
-            self._shutdown = True
-            
-            if self.receive_task and not self.receive_task.done():
-                self.receive_task.cancel()
-                try:
-                    await self.receive_task
-                except asyncio.CancelledError:
-                    pass
-
-            if self.process:
-                try:
-                    # Try graceful shutdown first
-                    self.process.terminate()
-                    try:
-                        await asyncio.wait_for(self.process.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        # Force kill if graceful shutdown fails
-                        logger.warning(f"Server {self.server_name}: Force killing process after timeout")
-                        self.process.kill()
-                        await self.process.wait()
-                except Exception as e:
-                    logger.error(f"Server {self.server_name}: Error during process cleanup: {str(e)}")
-                finally:
-                    if self.process.stdin:
-                        self.process.stdin.close()
-                    self.process = None
-    
-    # Alias close to stop for backward compatibility
-    async def close(self):
-        await self.stop()
-        
-    # Add async context manager support
-    async def __aenter__(self):
-        await self.start()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.stop()
 
 async def generate_text(conversation: List[Dict], model_cfg: Dict,
                        all_functions: List[Dict], stream: bool = False) -> Union[Dict, AsyncGenerator]:
@@ -274,7 +101,7 @@ async def generate_text(conversation: List[Dict], model_cfg: Dict,
     
     if provider == "openai":
         if stream:
-            return generate_with_openai(conversation, model_cfg, all_functions, stream=True)
+            return await generate_with_openai(conversation, model_cfg, all_functions, stream=True)
         else:
             return await generate_with_openai(conversation, model_cfg, all_functions, stream=False)
     
@@ -321,65 +148,6 @@ async def log_messages_to_file(messages: List[Dict], functions: List[Dict], log_
             }) + "\n")
     except Exception as e:
         logger.error(f"Error logging messages to {log_path}: {str(e)}")
-
-async def process_tool_call(tc: Dict, servers: Dict[str, MCPClient], quiet_mode: bool) -> Optional[Dict]:
-    """Process a single tool call and return the result"""
-    func_name = tc["function"]["name"]
-    func_args_str = tc["function"].get("arguments", "{}")
-    try:
-        func_args = json.loads(func_args_str)
-    except:
-        func_args = {}
-
-    parts = func_name.split("_", 1)
-    if len(parts) != 2:
-        return {
-            "role": "function",
-            "name": func_name,
-            "content": json.dumps({"error": "Invalid function name format"})
-        }
-
-    srv_name, tool_name = parts
-    if not quiet_mode:
-        print(f"\nView result from {tool_name} from {srv_name} {json.dumps(func_args)}")
-    else:
-        print(f"\nProcessing tool call...{tool_name}")
-
-    if srv_name not in servers:
-        return {
-            "role": "function",
-            "name": func_name,
-            "content": json.dumps({"error": f"Unknown server: {srv_name}"})
-        }
-
-    # Get the tool's schema
-    tool_schema = None
-    for tool in servers[srv_name].tools:
-        if tool["name"] == tool_name:
-            tool_schema = tool.get("inputSchema", {})
-            break
-
-    if tool_schema:
-        # Ensure required parameters are present
-        required_params = tool_schema.get("required", [])
-        for param in required_params:
-            if param not in func_args:
-                return {
-                    "role": "function",
-                    "name": func_name,
-                    "content": json.dumps({"error": f"Missing required parameter: {param}"})
-                }
-
-    result = await servers[srv_name].call_tool(tool_name, func_args)
-    if not quiet_mode:
-        print(json.dumps(result, indent=2))
-
-    return {
-        "role": "tool",
-        "tool_call_id": tc["id"],
-        "name": func_name,
-        "content": json.dumps(result)
-    }
 
 async def run_interaction(
     user_query: str,
@@ -443,44 +211,25 @@ async def run_interaction(
             return error_gen()
         return error_msg
 
-    # 3) Start servers
-    servers = {}
-    all_functions = []
-    for server_name, conf in servers_cfg.items():
-        client = MCPClient(
-            server_name=server_name,
-            command=conf.get("command"),
-            args=conf.get("args", []),
-            env=conf.get("env", {})
-        )
-        ok = await client.start()
-        if not ok:
-            if not quiet_mode:
-                print(f"[WARN] Could not start server {server_name}")
-            continue
+    # 3) Get or create global connection pool and stream processor
+    global _connection_pool
+    if _connection_pool is None:
+        _connection_pool = MCPConnectionPool(max_connections=10)
+    stream_processor = StreamProcessor(_connection_pool, quiet_mode)
 
-        # gather tools
-        tools = await client.list_tools()
-        for t in tools:
-            input_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
-            fn_def = {
-                "name": f"{server_name}_{t['name']}",
-                "description": t.get("description", ""),
-                "parameters": input_schema
-            }
-            all_functions.append(fn_def)
+    # 4) Initialize MCP if not already done
+    if _connection_pool is None or not _all_functions:  # Check if None or empty
+        await initialize_mcp(config=config, config_path=config_path)
+        if not _all_functions:  # If still empty after initialization
+            error_msg = "Failed to initialize MCP servers. No tools were registered."
+            if stream:
+                async def error_gen():
+                    yield error_msg
+                return error_gen()
+            return error_msg
 
-        servers[server_name] = client
 
-    if not servers:
-        error_msg = "No MCP servers could be started."
-        if stream:
-            async def error_gen():
-                yield error_msg
-            return error_gen()
-        return error_msg
-
-    # 4) Build conversation
+    # 5) Build conversation
     system_msg = chosen_model.get("systemMessage", "You are a helpful assistant.")
     conversation = [
         {"role": "system", "content": system_msg},
@@ -488,56 +237,26 @@ async def run_interaction(
     ]
 
     async def cleanup():
-        """Clean up servers and log messages"""
+        """Log messages if needed"""
         if log_messages_path:
-            await log_messages_to_file(conversation, all_functions, log_messages_path)
-        for cli in servers.values():
-            await cli.stop()
+            await log_messages_to_file(conversation, _all_functions, log_messages_path)
 
     if stream:
         async def stream_response():
             try:
                 while True:  # Main conversation loop
-                    generator = await generate_text(conversation, chosen_model, all_functions, stream=True)
-                    accumulated_text = ""
-                    tool_calls_processed = False
+                    generator = await generate_text(conversation, chosen_model, _all_functions, stream=True)
+                    async for chunk in  stream_processor.process_stream(generator, conversation):
+                        yield chunk
                     
-                    async for chunk in await generator:
-                        if chunk.get("is_chunk", False):
-                            # Immediately yield each token without accumulation
-                            if chunk.get("token", False):
-                                yield chunk["assistant_text"]
-                            accumulated_text += chunk["assistant_text"]
-                        else:
-                            # This is the final chunk with tool calls
-                            if accumulated_text != chunk["assistant_text"]:
-                                # If there's any remaining text, yield it
-                                remaining = chunk["assistant_text"][len(accumulated_text):]
-                                if remaining:
-                                    yield remaining
-                            
-                            # Process any tool calls from the final chunk
-                            tool_calls = chunk.get("tool_calls", [])
-                            if tool_calls:
-                                # Add the assistant's message with tool calls
-                                assistant_message = {
-                                    "role": "assistant",
-                                    "content": chunk["assistant_text"],
-                                    "tool_calls": tool_calls
-                                }
-                                conversation.append(assistant_message)
-                                
-                                # Process each tool call
-                                for tc in tool_calls:
-                                    if tc.get("function", {}).get("name"):
-                                        result = await process_tool_call(tc, servers, quiet_mode)
-                                        if result:
-                                            conversation.append(result)
-                                            tool_calls_processed = True
-                    
-                    # Break the loop if no tool calls were processed
-                    if not tool_calls_processed:
+                    # Break if no more tool calls to process
+                    if not conversation[-1].get("tool_calls"):
                         break
+                    
+                    # Process tool calls and add results to conversation
+                    tool_calls = conversation[-1].get("tool_calls", [])
+                    results = await stream_processor.process_tool_calls(tool_calls, servers_cfg)
+                    conversation.extend(results)
                     
             finally:
                 await cleanup()
@@ -547,7 +266,7 @@ async def run_interaction(
         try:
             final_text = ""
             while True:
-                gen_result = await generate_text(conversation, chosen_model, all_functions, stream=False)
+                gen_result = await generate_text(conversation, chosen_model, _all_functions, stream=False)
                 
                 assistant_text = gen_result["assistant_text"]
                 final_text = assistant_text
@@ -563,11 +282,8 @@ async def run_interaction(
                 if not tool_calls:
                     break
 
-                for tc in tool_calls:
-                    result = await process_tool_call(tc, servers, quiet_mode)
-                    if result:
-                        conversation.append(result)
-                        logger.info(f"Added tool result: {json.dumps(result, indent=2)}")
+                results = await stream_processor.process_tool_calls(tool_calls, servers_cfg)
+                conversation.extend(results)
 
             return final_text
         finally:

@@ -5,13 +5,12 @@ OpenAI provider implementation for Dolphin MCP.
 import os
 import json
 from typing import Dict, List, Any, AsyncGenerator, Optional, Union
-
 from openai import AsyncOpenAI, APIError, RateLimitError
 
 async def generate_with_openai_stream(client: AsyncOpenAI, model_name: str, conversation: List[Dict],
                                     formatted_functions: List[Dict], temperature: Optional[float] = None,
                                     top_p: Optional[float] = None, max_tokens: Optional[int] = None) -> AsyncGenerator:
-    """Internal function for streaming generation"""
+    """Internal function for streaming generation"""    
     try:
         response = await client.chat.completions.create(
             model=model_name,
@@ -31,14 +30,11 @@ async def generate_with_openai_stream(client: AsyncOpenAI, model_name: str, conv
             delta = chunk.choices[0].delta
             
             if delta.content:
-                # Immediately yield each token without buffering
                 yield {"assistant_text": delta.content, "tool_calls": [], "is_chunk": True, "token": True}
                 current_content += delta.content
 
-            # Handle tool call updates
             if delta.tool_calls:
                 for tool_call in delta.tool_calls:
-                    # Initialize or update tool call
                     while tool_call.index >= len(current_tool_calls):
                         current_tool_calls.append({
                             "id": "",
@@ -50,7 +46,6 @@ async def generate_with_openai_stream(client: AsyncOpenAI, model_name: str, conv
                     
                     current_tool = current_tool_calls[tool_call.index]
                     
-                    # Update tool call properties
                     if tool_call.id:
                         current_tool["id"] = tool_call.id
                     
@@ -60,62 +55,50 @@ async def generate_with_openai_stream(client: AsyncOpenAI, model_name: str, conv
                         )
                     
                     if tool_call.function.arguments:
-                        # Properly accumulate JSON arguments
                         current_args = current_tool["function"]["arguments"]
                         new_args = tool_call.function.arguments
                         
-                        # Handle special cases for JSON accumulation
                         if new_args.startswith("{") and not current_args:
                             current_tool["function"]["arguments"] = new_args
                         elif new_args.endswith("}") and current_args:
-                            # If we're receiving the end of the JSON object
                             if not current_args.endswith("}"):
                                 current_tool["function"]["arguments"] = current_args + new_args
                         else:
-                            # Middle part of JSON - append carefully
                             current_tool["function"]["arguments"] += new_args
 
-            # If this is the last chunk, yield final state with complete tool calls
             if chunk.choices[0].finish_reason is not None:
-                # Clean up and validate tool calls
                 final_tool_calls = []
                 for tc in current_tool_calls:
                     if tc["id"] and tc["function"]["name"]:
                         try:
-                            # Ensure arguments is valid JSON
                             args = tc["function"]["arguments"].strip()
                             if not args or args.isspace():
                                 args = "{}"
-                            # Parse and validate JSON
                             parsed_args = json.loads(args)
                             tc["function"]["arguments"] = json.dumps(parsed_args)
                             final_tool_calls.append(tc)
                         except json.JSONDecodeError:
-                            # If arguments are malformed, try to fix common issues
                             args = tc["function"]["arguments"].strip()
-                            # Remove any trailing commas
                             args = args.rstrip(",")
-                            # Ensure proper JSON structure
                             if not args.startswith("{"):
                                 args = "{" + args
                             if not args.endswith("}"):
                                 args = args + "}"
                             try:
-                                # Try parsing again after fixes
                                 parsed_args = json.loads(args)
                                 tc["function"]["arguments"] = json.dumps(parsed_args)
                                 final_tool_calls.append(tc)
                             except json.JSONDecodeError:
-                                # If still invalid, default to empty object
                                 tc["function"]["arguments"] = "{}"
                                 final_tool_calls.append(tc)
 
-                yield {
-                    "assistant_text": current_content,
-                    "tool_calls": final_tool_calls,
-                    "is_chunk": False
-                }
-
+                # Only yield final message if there are tool calls, and omit content since it was already streamed
+                if final_tool_calls:
+                    yield {
+                        "assistant_text": "",  # Content already streamed
+                        "tool_calls": final_tool_calls,
+                        "is_chunk": False
+                    }
     except Exception as e:
         yield {"assistant_text": f"OpenAI error: {str(e)}", "tool_calls": [], "is_chunk": False}
 
@@ -149,7 +132,6 @@ async def generate_with_openai_sync(client: AsyncOpenAI, model_name: str, conver
                             "arguments": tc.function.arguments or "{}"
                         }
                     }
-                    # Ensure arguments is valid JSON
                     try:
                         json.loads(tool_call["function"]["arguments"])
                     except json.JSONDecodeError:
@@ -180,8 +162,13 @@ async def generate_with_openai(conversation: List[Dict], model_cfg: Dict,
         If stream=True: AsyncGenerator yielding chunks of assistant text and tool calls
     """
     api_key = model_cfg.get("apiKey") or os.getenv("OPENAI_API_KEY")
+
+    # Time client initialization
     if "apiBase" in model_cfg:
-        client = AsyncOpenAI(api_key=api_key, base_url=model_cfg["apiBase"])
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=model_cfg["apiBase"],
+        )
     else:
         client = AsyncOpenAI(api_key=api_key)
 
