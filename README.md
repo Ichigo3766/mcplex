@@ -27,6 +27,7 @@ The project demonstrates how to:
 - **Environment Variable Support**: Securely store API keys in environment variables
 - **Comprehensive Documentation**: Detailed usage examples and API documentation
 - **Installable Package**: Easy installation via pip with `dolphin-mcp-cli` command
+- **Streaming Support**: Add stream=True to enable streaming.
 
 ## Prerequisites
 
