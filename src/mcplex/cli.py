@@ -1,5 +1,5 @@
 """
-Command-line interface for Dolphin MCP.
+Command-line interface for MCPlex - A powerful MCP client library.
 """
 
 import asyncio
@@ -13,7 +13,7 @@ def main():
     """
     # Check for help flag first
     if "--help" in sys.argv or "-h" in sys.argv:
-        print("Usage: dolphin-mcp-cli [--model <name>] [--quiet] [--config <file>] [--log-messages <file>] 'your question'")
+        print("Usage: mcplex-cli [--model <name>] [--quiet] [--config <file>] [--log-messages <file>] 'your question'")
         print("\nOptions:")
         print("  --model <name>         Specify the model to use")
         print("  --quiet                Suppress intermediate output")
@@ -24,7 +24,7 @@ def main():
         
     chosen_model_name, user_query, quiet_mode, config_path, log_messages_path = parse_arguments()
     if not user_query:
-        print("Usage: dolphin-mcp-cli [--model <name>] [--quiet] [--config <file>] 'your question'")
+        print("Usage: mcplex-cli [--model <name>] [--quiet] [--config <file>] 'your question'")
         sys.exit(1)
 
     # We do not pass a config object; we pass config_path

@@ -1,5 +1,5 @@
 """
-Optimized streaming implementation for Dolphin MCP.
+Optimized streaming implementation for MCPlex MCP.
 Handles efficient streaming of responses and parallel tool call processing.
 """
 
@@ -9,7 +9,7 @@ import logging
 from typing import Dict, List, Optional, AsyncGenerator, Any
 from .connection_pool import MCPConnectionPool
 
-logger = logging.getLogger("dolphin_mcp")
+logger = logging.getLogger("mcplex")
 
 class StreamProcessor:
     """

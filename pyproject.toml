@@ -3,13 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dolphin-mcp"
+name = "mcplex"
 version = "0.1.0"
-description = "A flexible Python client for interacting with Model Context Protocol (MCP) servers"
+description = "A flexible and powerful Python client for Model Context Protocol (MCP) servers with advanced connection management"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
+    {name = "Ichigo3766"},
     {name = "Dolphin MCP Team"}
 ]
 classifiers = [
@@ -38,7 +39,7 @@ demo = [
 ]
 
 [project.scripts]
-dolphin-mcp-cli = "dolphin_mcp.cli:main"
+mcplex-cli = "mcplex.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

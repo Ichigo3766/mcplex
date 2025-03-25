@@ -8,7 +8,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Any
 
-logger = logging.getLogger("dolphin_mcp")
+logger = logging.getLogger("mcplex")
 
 class MCPClient:
     """Implementation for a single MCP server."""
@@ -184,7 +184,7 @@ class MCPClient:
                 "protocolVersion": self.protocol_version,
                 "capabilities": {"sampling": {}},
                 "clientInfo": {
-                    "name": "DolphinMCPClient",
+                    "name": "MCPlexMCPClient",
                     "version": "1.0.0"
                 }
             }

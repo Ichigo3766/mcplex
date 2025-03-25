@@ -1,5 +1,5 @@
 """
-Connection pooling implementation for Dolphin MCP.
+Connection pooling implementation for MCPlex MCP.
 Provides efficient connection management and reuse for MCP servers.
 """
 
@@ -8,7 +8,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from .mcp_client import MCPClient
 
-logger = logging.getLogger("dolphin_mcp")
+logger = logging.getLogger("mcplex")
 
 class MCPConnectionPool:
     """

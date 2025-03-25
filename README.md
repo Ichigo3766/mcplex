@@ -1,12 +1,12 @@
-# Dolphin MCP
+# MCPlex
 
-A flexible Python library and CLI tool for interacting with Model Context Protocol (MCP) servers using any LLM model.
+A powerful and flexible Python library for interacting with Model Context Protocol (MCP) servers, featuring advanced connection management, caching, and timeout controls.
 
 ![CleanShot 2025-03-24 at 20 34 48](https://github.com/user-attachments/assets/ba0f24f2-ca1a-44f4-bd4f-01c800b0ca30)
 
 ## Overview
 
-Dolphin MCP is both a Python library and a command-line tool that allows you to query and interact with MCP servers through natural language. It connects to any number of configured MCP servers, makes their tools available to language models (OpenAI, Anthropic, Ollama), and provides a conversational interface for accessing and manipulating data from these servers.
+MCPlex is a Python library and command-line tool that enhances your interaction with MCP servers through natural language. It provides robust connection management, efficient caching, and fine-grained control over server interactions. The library seamlessly integrates with multiple LLM providers (OpenAI, Anthropic, Ollama) and offers a powerful interface for accessing and manipulating data from MCP servers.
 
 The project demonstrates how to:
 - Connect to multiple MCP servers simultaneously
@@ -26,7 +26,7 @@ The project demonstrates how to:
 - **Flexible Configuration**: Configure models, servers, and timeouts through JSON configuration
 - **Environment Variable Support**: Securely store API keys in environment variables
 - **Comprehensive Documentation**: Detailed usage examples and API documentation
-- **Installable Package**: Easy installation via pip with `dolphin-mcp-cli` command
+- **Installable Package**: Easy installation via pip with `mcplex-cli` command
 - **Streaming Support**: Add stream=True to enable streaming
 - **Connection Health Monitoring**: Automatic health checks and recovery
 - **Message Queuing**: Prevents concurrent writes and ensures message delivery
@@ -35,7 +35,7 @@ The project demonstrates how to:
 
 ## Prerequisites
 
-Before installing Dolphin MCP, ensure you have the following prerequisites installed:
+Before installing MCPlex MCP, ensure you have the following prerequisites installed:
 
 1. **Python 3.8+**
 2. **SQLite** - A lightweight database used by the demo
@@ -110,15 +110,15 @@ Before installing Dolphin MCP, ensure you have the following prerequisites insta
 ### Option 1: Install from PyPI (Recommended)
 
 ```bash
-pip install dolphin-mcp
+pip install mcplex
 ```
 
 ### Option 2: Install from Source
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/cognitivecomputations/dolphin-mcp.git
-   cd dolphin-mcp
+   git clone https://github.com/Ichigo3766/mcplex.git
+   cd mcplex
    ```
 
 2. Install the package in development mode:
@@ -186,13 +186,13 @@ The project uses two main configuration files:
 ### Using the CLI Command
 
 ```bash
-dolphin-mcp-cli "Your query here"
+mcplex-cli "Your query here"
 ```
 
 ### Command-line Options
 
 ```
-Usage: dolphin-mcp-cli [--model <name>] [--quiet] [--config <file>] [--stream] 'your question'
+Usage: mcplex-cli [--model <name>] [--quiet] [--config <file>] [--stream] 'your question'
 
 Options:
   --model <name>    Specify the model to use (can be model name or title from config)
@@ -206,14 +206,14 @@ Options:
 
 ```python
 import asyncio
-from dolphin_mcp import run_interaction
+from mcplex import run_interaction
 
 ## No streaming
 async def main():
 
    ## No streaming
    result = await run_interaction(
-      user_query="What dolphin species are endangered?",
+      user_query="Hello",
       model_name="gpt-4o",  # Can use either model name ("gpt-4o") or title ("GPT-4")
       config_path="mcp_config.json",
       quiet_mode=False,
@@ -223,7 +223,7 @@ async def main():
 
     ## Streaming
    async for chunk in await run_interaction(
-      user_query="What dolphin species are endangered?",,
+      user_query="Hello",
       model_name="gpt-4o",
       stream=True,
       config_path=mcp_config.json,
@@ -239,12 +239,12 @@ asyncio.run(main())
 ### Package Structure
 
 ```
-dolphin_mcp/
+mcplex/
 ├── __init__.py
 ├── client.py          # Core client implementation
 ├── mcp_client.py      # MCP server client
-├── connection_pool.py # Connection management
-├── stream_processor.py # Streaming support
+├── connection_pool.py # Connection management with caching
+├── stream_processor.py # Enhanced streaming support
 ├── cli.py            # Command-line interface
 ├── utils.py          # Utility functions
 └── providers/        # Model providers
@@ -260,6 +260,7 @@ dolphin_mcp/
    - Automatic health monitoring
    - Message queuing system
    - Per-server timeout configuration
+   - Ability to disable each server from config
 
 2. **Error Handling**
    - Automatic recovery from failures

@@ -1,20 +1,21 @@
 {
   "mcpServers": {
-    "dolphin-demo-database-sqlite": {
+    "mcplex-demo-database-sqlite": {
       "command": "uvx",
       "args": [
         "mcp-server-sqlite",
         "--db-path",
-        "~/.dolphin/dolphin.db"
+        "~/.mcplex/mcplex.db"
       ],
-      "timeout": 10
+      "timeout": 10,
+      "disabled": false 
     }
   },
   "models": [
     {
-      "title": "dolphin",
+      "title": "mcplex",
       "provider": "ollama",
-      "model": "dolphin3"
+      "model": "mcplex3"
     },
     {
       "title": "llama",
@@ -28,9 +29,9 @@
       "provider": "openai"
     },
     {
-      "title": "dolphin-r1",
+      "title": "mcplex-r1",
       "provider": "ollama",
-      "model": "dolphin3-r1",
+      "model": "mcplex3-r1",
       "temperature": 0.7,
       "top_k": 40
     },

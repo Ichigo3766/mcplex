@@ -1,5 +1,5 @@
 """
-Utility functions for Dolphin MCP.
+Utility functions for MCPlex MCP.
 """
 
 import os
@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.CRITICAL)
-logger = logging.getLogger("dolphin_mcp")
+logger = logging.getLogger("mcplex")
 logger.setLevel(logging.CRITICAL)
 
 # Load environment variables

@@ -12,7 +12,7 @@ from .providers.ollama import generate_with_ollama
 from .connection_pool import MCPConnectionPool
 from .stream_processor import StreamProcessor
 
-logger = logging.getLogger("dolphin_mcp")
+logger = logging.getLogger("mcplex")
 
 class MCPState:
     """Singleton class to manage MCP global state."""
