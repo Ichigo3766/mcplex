@@ -101,8 +101,8 @@ class StreamProcessor:
             
         result = await client.call_tool(tool_name, func_args)
         
-        # if not self.quiet_mode:
-        #     print(f"Result: {json.dumps(result.get('content', ''))}")
+        if not self.quiet_mode:
+            print(f"Result: {json.dumps(result.get('content', ''))}")
             
         
         return {

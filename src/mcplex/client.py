@@ -34,7 +34,7 @@ class MCPState:
     def initialized(self) -> bool:
         return bool(self._tool_cache)
 
-    async def ensure_initialized(self, config: dict) -> bool:
+    async def ensure_initialized(self, config: dict, quite_mode) -> bool:
         """Ensure MCP is initialized, with connection pooling and caching."""
         async with self._lock:
             if self.initialized:
@@ -47,15 +47,15 @@ class MCPState:
 
             self._initializing = True
             try:
-                return await self._initialize(config)
+                return await self._initialize(config, quite_mode)
             finally:
                 self._initializing = False
 
-    async def _initialize(self, config: dict) -> bool:
+    async def _initialize(self, config: dict, quite_mode) -> bool:
         """Internal initialization with efficient connection handling."""
         if not self.connection_pool:
             self.connection_pool = MCPConnectionPool(max_connections=10)
-            self.stream_processor = StreamProcessor(self.connection_pool)
+            self.stream_processor = StreamProcessor(self.connection_pool, quiet_mode=quite_mode)
         
         servers_cfg = {
             name: conf for name, conf in config.get("mcpServers", {}).items()
@@ -195,6 +195,7 @@ async def run_interaction(
     model_name: Optional[str] = None,
     config: Optional[dict] = None,
     config_path: str = "mcp_config.json",
+    quite_mode: bool = False,
     log_messages_path: Optional[str] = None,
     stream: bool = False
 ) -> Union[str, AsyncGenerator[Union[str, Dict], None]]:
@@ -215,7 +216,7 @@ async def run_interaction(
         return error_msg
     
     # Ensure MCP is initialized (now using efficient async initialization)
-    if not await _state.ensure_initialized(config):
+    if not await _state.ensure_initialized(config, quite_mode):
         error_msg = "Failed to initialize MCP servers. No tools were registered."
         if stream:
             async def error_stream():
