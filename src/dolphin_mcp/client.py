@@ -57,9 +57,12 @@ class MCPState:
             self.connection_pool = MCPConnectionPool(max_connections=10)
             self.stream_processor = StreamProcessor(self.connection_pool)
         
-        servers_cfg = config.get("mcpServers", {})
+        servers_cfg = {
+            name: conf for name, conf in config.get("mcpServers", {}).items()
+            if not conf.get("disabled", False)  # Filter out disabled servers
+        }
         if not servers_cfg:
-            logger.error("No MCP servers configured")
+            logger.error("No enabled MCP servers found in configuration")
             return False
 
         # Initialize connections and fetch tools only for servers we haven't cached
@@ -138,7 +141,9 @@ def _select_model(models_cfg: List[Dict], model_name: Optional[str] = None) -> O
         return None
         
     if model_name:
-        return next((m for m in models_cfg if m.get("model") == model_name or m.get("title") == model_name), 
+        # Match either model name or title case-insensitively
+        model_name_lower = model_name.lower()
+        return next((m for m in models_cfg if m.get("model", "").lower() == model_name_lower or m.get("title", "").lower() == model_name_lower),
                    next((m for m in models_cfg if m.get("default")), models_cfg[0]))
     
     return next((m for m in models_cfg if m.get("default")), models_cfg[0])
@@ -190,7 +195,6 @@ async def run_interaction(
     model_name: Optional[str] = None,
     config: Optional[dict] = None,
     config_path: str = "mcp_config.json",
-    show_tool_calls: bool = True,
     log_messages_path: Optional[str] = None,
     stream: bool = False
 ) -> Union[str, AsyncGenerator[Union[str, Dict], None]]:

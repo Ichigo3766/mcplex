@@ -154,12 +154,13 @@ The project uses two main configuration files:
            "ENV_VAR1": "value1",
            "ENV_VAR2": "value2"
          },
-         "timeout": 3600.0  // Server response timeout in seconds (default: 1 hour)
+         "timeout": 300
        },
        "server2": {
          "command": "another-server-command",
          "args": ["--option", "value"],
-         "timeout": 300.0   // 5-minute timeout for faster operations
+         "timeout": 10,
+         "disabled": true  // This server will be skipped
        }
      },
      "models": [
@@ -178,6 +179,7 @@ The project uses two main configuration files:
    - `args`: Command-line arguments for the server
    - `env`: Environment variables for the server
    - `timeout`: Maximum time to wait for server responses (in seconds, default: 3600.0)
+   - `disabled`: Optional boolean flag to disable a server without removing its configuration
 
 ## Usage
 
@@ -193,7 +195,7 @@ dolphin-mcp-cli "Your query here"
 Usage: dolphin-mcp-cli [--model <name>] [--quiet] [--config <file>] [--stream] 'your question'
 
 Options:
-  --model <name>    Specify the model to use
+  --model <name>    Specify the model to use (can be model name or title from config)
   --quiet           Suppress intermediate output
   --config <file>   Specify a custom config file (default: mcp_config.json)
   --stream          Enable streaming mode
@@ -212,7 +214,7 @@ async def main():
    ## No streaming
    result = await run_interaction(
       user_query="What dolphin species are endangered?",
-      model_name="gpt-4o",
+      model_name="gpt-4o",  # Can use either model name ("gpt-4o") or title ("GPT-4")
       config_path="mcp_config.json",
       quiet_mode=False,
       stream=False

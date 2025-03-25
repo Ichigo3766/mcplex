@@ -81,6 +81,11 @@ class MCPConnectionPool:
         if self._shutdown:
             return None
             
+        # Check if server is disabled
+        if config.get("disabled", False):
+            logger.info(f"Skipping disabled server: {server_name}")
+            return None
+            
         if server_name not in self.connections:
             self.connections[server_name] = []
             self.semaphores[server_name] = asyncio.Semaphore(self.max_connections)
