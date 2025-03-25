@@ -1,5 +1,5 @@
 """
-Dolphin MCP - A flexible Python client for interacting with Model Context Protocol (MCP) servers.
+MCPlex - A flexible Python client for interacting with Model Context Protocol (MCP) servers.
 """
 
 from .client import run_interaction, MCPState, initialize_mcp
