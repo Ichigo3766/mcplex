@@ -1,7 +1,3 @@
-"""
-Core client functionality for Dolphin MCP.
-"""
-
 import os
 import sys
 import json
@@ -15,137 +11,177 @@ from .providers.anthropic import generate_with_anthropic
 from .providers.ollama import generate_with_ollama
 from .connection_pool import MCPConnectionPool
 from .stream_processor import StreamProcessor
-from .mcp_client import MCPClient
-
-# Global instances
-_connection_pool = None
-_all_functions = None
-
-async def initialize_mcp(config: Optional[dict] = None, config_path: str = "mcp_config.json"):
-    """Initialize MCP servers and cache their tool definitions.
-    This should be called once when the application starts."""
-    global _connection_pool, _all_functions
-    
-    if _connection_pool is not None and _all_functions:
-        logger.info("MCP already initialized with %d tools", len(_all_functions))
-        return  # Already initialized with tools
-    
-    logger.info("Starting MCP initialization...")
-    
-    # Load or use provided config
-    if config is None:
-        logger.info("Loading config from %s", config_path)
-        config = await load_mcp_config_from_file(config_path)
-    servers_cfg = config.get("mcpServers", {})
-    logger.info("Found %d MCP servers in config", len(servers_cfg))
-    
-    # Initialize connection pool and tools list
-    _connection_pool = MCPConnectionPool(max_connections=10)
-    _all_functions = []
-    
-    # Get tool definitions from all servers
-    logger.info("Connecting to MCP servers and retrieving tool definitions...")
-    tasks = {}
-    for server_name, conf in servers_cfg.items():
-        client = await _connection_pool.get_connection(server_name, conf)
-        if client:
-            tasks[server_name] = client.list_tools()
-    
-    if tasks:
-        logger.info("Found %d servers to connect to", len(tasks))
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for server_name, tools in zip(tasks.keys(), results):
-            logger.info("Processing tools for server %s", server_name)
-            if isinstance(tools, Exception):
-                logger.error(f"Error getting tools for {server_name}: {str(tools)}")
-                continue
-            for t in tools:
-                input_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
-                fn_def = {
-                    "name": f"{server_name}_{t['name']}",
-                    "description": t.get("description", ""),
-                    "parameters": input_schema
-                }
-                _all_functions.append(fn_def)
-    
-    logger.info("MCP initialization complete. Registered %d tools", len(_all_functions))
-    if not _all_functions:
-        raise RuntimeError("No MCP servers could be started.")
-
-
-async def shutdown():
-    """Cleanup the global connection pool when application shuts down."""
-    global _connection_pool
-    if _connection_pool:
-        await _connection_pool.cleanup()
-        _connection_pool = None
 
 logger = logging.getLogger("dolphin_mcp")
 
+class MCPState:
+    """Singleton class to manage MCP global state."""
+    _instance = None
+    _lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(MCPState, cls).__new__(cls)
+            cls._instance.connection_pool = None
+            cls._instance.stream_processor = None
+            cls._instance.all_functions = []
+            cls._instance._initializing = False
+            cls._instance._server_connections = {}
+            cls._instance._tool_cache = {}
+        return cls._instance
+
+    @property
+    def initialized(self) -> bool:
+        return bool(self._tool_cache)
+
+    async def ensure_initialized(self, config: dict) -> bool:
+        """Ensure MCP is initialized, with connection pooling and caching."""
+        async with self._lock:
+            if self.initialized:
+                return True
+                
+            if self._initializing:
+                while self._initializing:
+                    await asyncio.sleep(0.1)
+                return self.initialized
+
+            self._initializing = True
+            try:
+                return await self._initialize(config)
+            finally:
+                self._initializing = False
+
+    async def _initialize(self, config: dict) -> bool:
+        """Internal initialization with efficient connection handling."""
+        if not self.connection_pool:
+            self.connection_pool = MCPConnectionPool(max_connections=10)
+            self.stream_processor = StreamProcessor(self.connection_pool)
+        
+        servers_cfg = config.get("mcpServers", {})
+        if not servers_cfg:
+            logger.error("No MCP servers configured")
+            return False
+
+        # Initialize connections and fetch tools only for servers we haven't cached
+        uncached_servers = {
+            name: conf for name, conf in servers_cfg.items()
+            if name not in self._tool_cache
+        }
+
+        if uncached_servers:
+            tasks = {
+                name: self.connection_pool.get_connection(name, conf)
+                for name, conf in uncached_servers.items()
+            }
+            
+            clients = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            active_clients = {
+                name: client for name, client in zip(tasks.keys(), clients)
+                if not isinstance(client, Exception) and client is not None
+            }
+
+            # Fetch and cache tools for new servers
+            tool_tasks = [
+                self._fetch_and_cache_tools(name, client)
+                for name, client in active_clients.items()
+            ]
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
+
+        # Update all_functions from cache
+        self.all_functions = [
+            tool for tools in self._tool_cache.values()
+            for tool in tools
+        ]
+
+        return bool(self.all_functions)
+
+    async def _fetch_and_cache_tools(self, server_name: str, client: Any) -> None:
+        """Fetch and cache tools for a server."""
+        try:
+            tools = await client.list_tools()
+            self._tool_cache[server_name] = [
+                {
+                    "name": f"{server_name}_{t['name']}",
+                    "description": t.get("description", ""),
+                    "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}
+                } for t in tools
+            ]
+        except Exception as e:
+            logger.error(f"Error fetching tools for {server_name}: {str(e)}")
+            self._tool_cache[server_name] = []
+
+    def reset(self):
+        """Reset the state."""
+        self.connection_pool = None
+        self.all_functions = []
+        self._tool_cache = {}
+        self._server_connections = {}
+
+_state = MCPState()
+
+async def initialize_mcp(config: Optional[dict] = None, config_path: str = "mcp_config.json"):
+    """Initialize MCP servers and cache their tool definitions."""
+    if config is None:
+        config = await load_mcp_config_from_file(config_path)
+    
+    return await _state.ensure_initialized(config)
+
+async def shutdown():
+    """Cleanup the global connection pool when application shuts down."""
+    if _state.connection_pool:
+        await _state.connection_pool.cleanup()
+        _state.reset()
+
+def _select_model(models_cfg: List[Dict], model_name: Optional[str] = None) -> Optional[Dict]:
+    """Helper function to select appropriate model configuration."""
+    if not models_cfg:
+        return None
+        
+    if model_name:
+        return next((m for m in models_cfg if m.get("model") == model_name or m.get("title") == model_name), 
+                   next((m for m in models_cfg if m.get("default")), models_cfg[0]))
+    
+    return next((m for m in models_cfg if m.get("default")), models_cfg[0])
+
 async def generate_text(conversation: List[Dict], model_cfg: Dict,
                        all_functions: List[Dict], stream: bool = False) -> Union[Dict, AsyncGenerator]:
-    """
-    Generate text using the specified provider.
-    
-    Args:
-        conversation: The conversation history
-        model_cfg: Configuration for the model
-        all_functions: Available functions for the model to call
-        stream: Whether to stream the response
-        
-    Returns:
-        If stream=False: Dict containing assistant_text and tool_calls
-        If stream=True: AsyncGenerator yielding chunks of assistant text and tool calls
-    """
+    """Generate text using the specified provider."""
     provider = model_cfg.get("provider", "").lower()
     
-    if provider == "openai":
+    # Map providers to their generation functions
+    provider_map = {
+        "openai": generate_with_openai,
+        "anthropic": generate_with_anthropic,
+        "ollama": generate_with_ollama
+    }
+    
+    if provider not in provider_map:
+        error_result = {"assistant_text": f"Unsupported provider '{provider}'", "tool_calls": []}
         if stream:
-            return await generate_with_openai(conversation, model_cfg, all_functions, stream=True)
-        else:
-            return await generate_with_openai(conversation, model_cfg, all_functions, stream=False)
+            async def error_stream():
+                yield error_result
+            return error_stream()
+        return error_result
     
-    # For non-streaming providers, wrap the response in an async generator if streaming is requested
+    provider_func = provider_map[provider]
+    
     if stream:
-        async def wrap_response():
-            if provider == "anthropic":
-                result = await generate_with_anthropic(conversation, model_cfg, all_functions)
-            elif provider == "ollama":
-                result = await generate_with_ollama(conversation, model_cfg, all_functions)
-            else:
-                result = {"assistant_text": f"Unsupported provider '{provider}'", "tool_calls": []}
-            yield result
-        return wrap_response()
-    
-    # Non-streaming path
-    if provider == "anthropic":
-        return await generate_with_anthropic(conversation, model_cfg, all_functions)
-    elif provider == "ollama":
-        return await generate_with_ollama(conversation, model_cfg, all_functions)
+        if provider == "openai":
+            return await provider_func(conversation, model_cfg, all_functions, stream=True)
+        else:
+            async def wrap_stream():
+                result = await provider_func(conversation, model_cfg, all_functions)
+                yield result
+            return wrap_stream()
     else:
-        return {"assistant_text": f"Unsupported provider '{provider}'", "tool_calls": []}
+        return await provider_func(conversation, model_cfg, all_functions, stream=False)
 
 async def log_messages_to_file(messages: List[Dict], functions: List[Dict], log_path: str):
-    """
-    Log messages and function definitions to a JSONL file.
-    
-    Args:
-        messages: List of messages to log
-        functions: List of function definitions
-        log_path: Path to the log file
-    """
+    """Log messages and function definitions to a JSONL file."""
     try:
-        # Create directory if it doesn't exist
-        log_dir = os.path.dirname(log_path)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-            
-        # Append to file
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a") as f:
-            f.write(json.dumps({
-                "messages": messages,
-                "functions": functions
-            }) + "\n")
+            f.write(json.dumps({"messages": messages, "functions": functions}) + "\n")
     except Exception as e:
         logger.error(f"Error logging messages to {log_path}: {str(e)}")
 
@@ -154,137 +190,99 @@ async def run_interaction(
     model_name: Optional[str] = None,
     config: Optional[dict] = None,
     config_path: str = "mcp_config.json",
-    quiet_mode: bool = False,
+    show_tool_calls: bool = True,
     log_messages_path: Optional[str] = None,
     stream: bool = False
-) -> Union[str, AsyncGenerator[str, None]]:
-    """
-    Run an interaction with the MCP servers.
+) -> Union[str, AsyncGenerator[Union[str, Dict], None]]:
+    """Run an interaction with the MCP servers."""
     
-    Args:
-        user_query: The user's query
-        model_name: Name of the model to use (optional)
-        config: Configuration dict (optional, if not provided will load from config_path)
-        config_path: Path to the configuration file (default: mcp_config.json)
-        quiet_mode: Whether to suppress intermediate output (default: False)
-        log_messages_path: Path to log messages in JSONL format (optional)
-        stream: Whether to stream the response (default: False)
-        
-    Returns:
-        If stream=False: The final text response
-        If stream=True: AsyncGenerator yielding chunks of the response
-    """
-    # 1) If config is not provided, load from file:
+    # Load configuration if not provided
     if config is None:
         config = await load_mcp_config_from_file(config_path)
-
-    servers_cfg = config.get("mcpServers", {})
-    models_cfg = config.get("models", [])
-
-    # 2) Choose a model
-    chosen_model = None
-    if model_name:
-        for m in models_cfg:
-            if m.get("model") == model_name:
-                chosen_model = m
-                break
-        if not chosen_model:
-            # fallback to default or fail
-            for m in models_cfg:
-                if m.get("default"):
-                    chosen_model = m
-                    break
-    else:
-        # if model_name not specified, pick default
-        for m in models_cfg:
-            if m.get("default"):
-                chosen_model = m
-                break
-        if not chosen_model and models_cfg:
-            chosen_model = models_cfg[0]
-
+    
+    # Select model
+    chosen_model = _select_model(config.get("models", []), model_name)
     if not chosen_model:
         error_msg = "No suitable model found in config."
         if stream:
-            async def error_gen():
+            async def error_stream():
                 yield error_msg
-            return error_gen()
+            return error_stream()
         return error_msg
-
-    # 3) Get or create global connection pool and stream processor
-    global _connection_pool
-    if _connection_pool is None:
-        _connection_pool = MCPConnectionPool(max_connections=10)
-    stream_processor = StreamProcessor(_connection_pool, quiet_mode)
-
-    # 4) Initialize MCP if not already done
-    if _connection_pool is None or not _all_functions:  # Check if None or empty
-        await initialize_mcp(config=config, config_path=config_path)
-        if not _all_functions:  # If still empty after initialization
-            error_msg = "Failed to initialize MCP servers. No tools were registered."
-            if stream:
-                async def error_gen():
-                    yield error_msg
-                return error_gen()
-            return error_msg
-
-
-    # 5) Build conversation
-    system_msg = chosen_model.get("systemMessage", "You are a helpful assistant.")
+    
+    # Ensure MCP is initialized (now using efficient async initialization)
+    if not await _state.ensure_initialized(config):
+        error_msg = "Failed to initialize MCP servers. No tools were registered."
+        if stream:
+            async def error_stream():
+                yield error_msg
+            return error_stream()
+        return error_msg
+    
+    # Initialize conversation
     conversation = [
-        {"role": "system", "content": system_msg},
+        {"role": "system", "content": chosen_model.get("systemMessage", "You are a helpful assistant with access to MCP servers. You will carefully examine the query and use MCP servers IF needed to answer the query.")},
         {"role": "user", "content": user_query}
     ]
-
+    
+    # Use singleton stream processor
     async def cleanup():
-        """Log messages if needed"""
+        """Log messages and cleanup if needed"""
         if log_messages_path:
-            await log_messages_to_file(conversation, _all_functions, log_messages_path)
-
+            await log_messages_to_file(conversation, _state.all_functions, log_messages_path)
+    
     if stream:
         async def stream_response():
             try:
-                while True:  # Main conversation loop
-                    generator = await generate_text(conversation, chosen_model, _all_functions, stream=True)
-                    async for chunk in  stream_processor.process_stream(generator, conversation):
+                while True:
+                    generator = await generate_text(conversation, chosen_model, _state.all_functions, stream=True)
+                    async for chunk in _state.stream_processor.process_stream(generator, conversation):
                         yield chunk
                     
-                    # Break if no more tool calls to process
                     if not conversation[-1].get("tool_calls"):
                         break
                     
-                    # Process tool calls and add results to conversation
                     tool_calls = conversation[-1].get("tool_calls", [])
-                    results = await stream_processor.process_tool_calls(tool_calls, servers_cfg)
-                    conversation.extend(results)
-                    
+                    try:
+                        results = await _state.stream_processor.process_tool_calls(tool_calls, config.get("mcpServers", {}))
+                        conversation.extend(results)
+                    except Exception as e:
+                        logger.error(f"Error processing tool calls: {str(e)}")
+                        yield f"\nError processing tool calls: {str(e)}"
+                        break
+            except Exception as e:
+                logger.error(f"Error in stream response: {str(e)}")
+                yield f"\nError: {str(e)}"
             finally:
                 await cleanup()
-        
         return stream_response()
-    else:
-        try:
-            final_text = ""
-            while True:
-                gen_result = await generate_text(conversation, chosen_model, _all_functions, stream=False)
+    
+    try:
+        final_text = ""
+        while True:
+            try:
+                gen_result = await generate_text(conversation, chosen_model, _state.all_functions, stream=False)
                 
                 assistant_text = gen_result["assistant_text"]
                 final_text = assistant_text
                 tool_calls = gen_result.get("tool_calls", [])
-
-                # Add the assistant's message
-                assistant_message = {"role": "assistant", "content": assistant_text}
-                if tool_calls:
-                    assistant_message["tool_calls"] = tool_calls
+                
+                assistant_message = {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    **({"tool_calls": tool_calls} if tool_calls else {})
+                }
                 conversation.append(assistant_message)
-                logger.info(f"Added assistant message: {json.dumps(assistant_message, indent=2)}")
-
+                
                 if not tool_calls:
                     break
-
-                results = await stream_processor.process_tool_calls(tool_calls, servers_cfg)
+                
+                results = await _state.stream_processor.process_tool_calls(tool_calls, config.get("mcpServers", {}))
                 conversation.extend(results)
-
-            return final_text
-        finally:
-            await cleanup()
+            except Exception as e:
+                logger.error(f"Error in non-stream response: {str(e)}")
+                return f"Error: {str(e)}"
+        
+        return final_text
+    finally:
+        await cleanup()

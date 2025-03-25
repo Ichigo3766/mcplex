@@ -6,7 +6,8 @@
         "mcp-server-sqlite",
         "--db-path",
         "~/.dolphin/dolphin.db"
-      ]
+      ],
+      "timeout": 10
     }
   },
   "models": [
