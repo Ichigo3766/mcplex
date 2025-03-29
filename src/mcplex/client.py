@@ -1,293 +1,438 @@
+"""
+Main MCP client interface.
+"""
+
 import os
-import sys
 import json
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Union, AsyncGenerator
+from typing import Dict, List, Optional, Union, AsyncGenerator
 
+from .mcp_types import ServerConfig
+from .mcp_manager import MCPManager
+from .mcp_errors import MCPError, ConfigurationError
 from .utils import load_mcp_config_from_file
 from .providers.openai import generate_with_openai
 from .providers.anthropic import generate_with_anthropic
 from .providers.ollama import generate_with_ollama
-from .connection_pool import MCPConnectionPool
-from .stream_processor import StreamProcessor
 
 logger = logging.getLogger("mcplex")
 
-class MCPState:
-    """Singleton class to manage MCP global state."""
-    _instance = None
-    _lock = asyncio.Lock()
+class MCPClient:
+    """Main interface for MCP operations."""
     
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(MCPState, cls).__new__(cls)
-            cls._instance.connection_pool = None
-            cls._instance.stream_processor = None
-            cls._instance.all_functions = []
-            cls._instance._initializing = False
-            cls._instance._server_connections = {}
-            cls._instance._tool_cache = {}
-        return cls._instance
+    def __init__(self):
+        self.manager = MCPManager()
+        self._initialized = False
+        self._lock = asyncio.Lock()
 
-    @property
-    def initialized(self) -> bool:
-        return bool(self._tool_cache)
-
-    async def ensure_initialized(self, config: dict, quite_mode) -> bool:
-        """Ensure MCP is initialized, with connection pooling and caching."""
+    async def initialize(self, config: Optional[Dict] = None, config_path: str = "mcp_config.json", quiet_mode: bool = False) -> bool:
+        """Initialize MCP with configuration."""
         async with self._lock:
-            if self.initialized:
+            if self._initialized:
                 return True
-                
-            if self._initializing:
-                while self._initializing:
-                    await asyncio.sleep(0.1)
-                return self.initialized
 
-            self._initializing = True
             try:
-                return await self._initialize(config, quite_mode)
-            finally:
-                self._initializing = False
+                if config is None:
+                    config = await load_mcp_config_from_file(config_path)
 
-    async def _initialize(self, config: dict, quite_mode) -> bool:
-        """Internal initialization with efficient connection handling."""
-        if not self.connection_pool:
-            self.connection_pool = MCPConnectionPool(max_connections=10)
-            self.stream_processor = StreamProcessor(self.connection_pool, quiet_mode=quite_mode)
-        
-        servers_cfg = {
-            name: conf for name, conf in config.get("mcpServers", {}).items()
-            if not conf.get("disabled", False)  # Filter out disabled servers
-        }
-        if not servers_cfg:
-            logger.error("No enabled MCP servers found in configuration")
-            return False
+                servers_cfg = {
+                    name: conf for name, conf in config.get("mcpServers", {}).items()
+                    if not conf.get("disabled", False)
+                }
 
-        # Initialize connections and fetch tools only for servers we haven't cached
-        uncached_servers = {
-            name: conf for name, conf in servers_cfg.items()
-            if name not in self._tool_cache
-        }
+                if not servers_cfg:
+                    raise ConfigurationError("No enabled MCP servers found in configuration")
 
-        if uncached_servers:
-            tasks = {
-                name: self.connection_pool.get_connection(name, conf)
-                for name, conf in uncached_servers.items()
-            }
+                # Initialize each server
+                for name, conf in servers_cfg.items():
+                    if not quiet_mode:
+                        logger.info(f"Initializing server: {name}")
+                    
+                    server_config = ServerConfig(
+                        name=name,
+                        command=conf["command"],
+                        args=conf.get("args", []),
+                        env=conf.get("env"),
+                        timeout=conf.get("timeout", 30),
+                        init_timeout_multiplier=conf.get("init_timeout_multiplier", 1)
+                    )
+
+                    if not await self.manager.initialize_server(server_config):
+                        logger.error(f"Failed to initialize server: {name}")
+                        continue
+
+                    if not quiet_mode:
+                        logger.info(f"Successfully initialized server: {name}")
+
+                self._initialized = bool(self.manager.all_tools)
+                return self._initialized
+
+            except Exception as e:
+                logger.error(f"Initialization failed: {str(e)}")
+                return False
+
+    async def shutdown(self):
+        """Clean up resources."""
+        await self.manager.cleanup()
+        self._initialized = False
+
+    def _select_model(self, models_cfg: List[Dict], model_name: Optional[str] = None) -> Optional[Dict]:
+        """Select appropriate model configuration."""
+        if not models_cfg:
+            return None
             
-            clients = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            active_clients = {
-                name: client for name, client in zip(tasks.keys(), clients)
-                if not isinstance(client, Exception) and client is not None
-            }
+        if model_name:
+            model_name_lower = model_name.lower()
+            return next(
+                (m for m in models_cfg 
+                 if m.get("model", "").lower() == model_name_lower 
+                 or m.get("title", "").lower() == model_name_lower),
+                next((m for m in models_cfg if m.get("default")), models_cfg[0])
+            )
+        
+        return next((m for m in models_cfg if m.get("default")), models_cfg[0])
 
-            # Fetch and cache tools for new servers
-            tool_tasks = [
-                self._fetch_and_cache_tools(name, client)
-                for name, client in active_clients.items()
-            ]
-            await asyncio.gather(*tool_tasks, return_exceptions=True)
+    async def generate_text(self, conversation: List[Dict], model_cfg: Dict, stream: bool = False) -> Union[Dict, AsyncGenerator]:
+        """Generate text using the specified provider."""
+        provider = model_cfg.get("provider", "").lower()
+        
+        provider_map = {
+            "openai": generate_with_openai,
+            "anthropic": generate_with_anthropic,
+            "ollama": generate_with_ollama
+        }
+        
+        if provider not in provider_map:
+            error_result = {"assistant_text": f"Unsupported provider '{provider}'", "tool_calls": []}
+            if stream:
+                async def error_stream():
+                    yield error_result
+                return error_stream()
+            return error_result
+        
+        provider_func = provider_map[provider]
+        
+        # Convert ToolDefinition objects to dictionaries
+        tools = [tool.to_dict() for tool in self.manager.all_tools]
+        
+        if stream:
+            if provider == "openai":
+                return await provider_func(conversation, model_cfg, tools, stream=True)
+            else:
+                async def wrap_stream():
+                    result = await provider_func(conversation, model_cfg, tools)
+                    yield result
+                return wrap_stream()
+        else:
+            return await provider_func(conversation, model_cfg, tools, stream=False)
 
-        # Update all_functions from cache
-        self.all_functions = [
-            tool for tools in self._tool_cache.values()
-            for tool in tools
+    async def process_tool_calls(self, tool_calls: List[Dict], servers_cfg: Dict) -> List[Dict]:
+        """Process tool calls and return results."""
+        results = []
+        
+        for call in tool_calls:
+            try:
+                # Handle both function_call and tool_calls format
+                if "function" in call:
+                    # OpenAI format
+                    name = call["function"]["name"]
+                    arguments = json.loads(call["function"].get("arguments", "{}"))
+                    call_id = call.get("id", "")
+                elif "name" in call:
+                    # Direct format
+                    name = call["name"]
+                    arguments = call.get("arguments", {})
+                    call_id = call.get("id", "")
+                else:
+                    raise MCPError("Invalid tool call format")
+
+                name_parts = name.split("_", 1)
+                if len(name_parts) != 2:
+                    raise MCPError(f"Invalid tool name format: {name}")
+                
+                server_name, tool_name = name_parts
+                if server_name not in servers_cfg:
+                    raise MCPError(f"Unknown server: {server_name}")
+
+                result = await self.manager.call_tool(
+                    server_name,
+                    tool_name,
+                    arguments
+                )
+
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": json.dumps(result)
+                })
+
+            except Exception as e:
+                error_msg = f"Tool call failed: {str(e)}"
+                logger.error(error_msg)
+                if "function" in call:
+                    name = call["function"].get("name", "unknown")
+                    call_id = call.get("id", "")
+                else:
+                    name = call.get("name", "unknown")
+                    call_id = call.get("id", "")
+                    
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": json.dumps({"error": error_msg})
+                })
+
+        return results
+
+    async def run_interaction(
+        self,
+        user_query: str,
+        model_name: Optional[str] = None,
+        config: Optional[dict] = None,
+        config_path: str = "mcp_config.json",
+        quiet_mode: bool = False,
+        log_messages_path: Optional[str] = None,
+        stream: bool = False,
+        show_tool_calls: bool = False
+    ) -> Union[str, AsyncGenerator[Union[str, Dict], None]]:
+        """Run an interaction with the MCP system."""
+        
+        if config is None:
+            config = await load_mcp_config_from_file(config_path)
+        
+        chosen_model = self._select_model(config.get("models", []), model_name)
+        if not chosen_model:
+            error_msg = "No suitable model found in config."
+            if stream:
+                async def error_stream():
+                    yield error_msg
+                return error_stream()
+            return error_msg
+        
+        if not await self.initialize(config, config_path, quiet_mode):
+            error_msg = "Failed to initialize MCP servers."
+            if stream:
+                async def error_stream():
+                    yield error_msg
+                return error_stream()
+            return error_msg
+        
+        conversation = [
+            {
+                "role": "system",
+                "content": chosen_model.get(
+                    "systemMessage",
+                    "You are a helpful assistant with access to MCP servers. You will carefully examine the query and use MCP servers IF needed to answer the query."
+                )
+            },
+            {"role": "user", "content": user_query}
         ]
+        
+        async def log_messages():
+            """Log messages if path provided."""
+            if log_messages_path:
+                try:
+                    os.makedirs(os.path.dirname(log_messages_path), exist_ok=True)
+                    with open(log_messages_path, "a") as f:
+                        f.write(json.dumps({
+                            "messages": conversation,
+                            "functions": [t.to_dict() for t in self.manager.all_tools]
+                        }) + "\n")
+                except Exception as e:
+                    logger.error(f"Error logging messages to {log_messages_path}: {str(e)}")
+        
+        if stream:
+            async def stream_response():
+                try:
+                    needs_continuation = True
+                    while needs_continuation:
+                        generator = await self.generate_text(conversation, chosen_model, stream=True)
+                        current_text = []
+                        has_tool_calls = False
+                        
+                        async for chunk in generator:
+                            if isinstance(chunk, dict):
+                                # Extract text content from chunk
+                                text = chunk.get("assistant_text", "")
+                                is_chunk = chunk.get("is_chunk", False)
+                                
+                                if text:
+                                    # For chunks, append to list and yield
+                                    if is_chunk:
+                                        current_text.append(text)
+                                        yield text
+                                    else:
+                                        # For complete messages, yield the full text
+                                        yield text
+                                        current_text = [text]
 
-        return bool(self.all_functions)
+                                # Process tool calls if present
+                                tool_calls = chunk.get("tool_calls", [])
+                                if tool_calls:
+                                    has_tool_calls = True
+                                    # Update conversation with current state
+                                    conversation.append({
+                                        "role": "assistant",
+                                        "content": "".join(current_text),
+                                        "tool_calls": tool_calls
+                                    })
 
-    async def _fetch_and_cache_tools(self, server_name: str, client: Any) -> None:
-        """Fetch and cache tools for a server."""
+                                    if show_tool_calls:
+                                        # Show tool calls being made
+                                        for call in tool_calls:
+                                            if "function" in call:
+                                                name = call["function"]["name"]
+                                                args = call["function"].get("arguments", "{}")
+                                            else:
+                                                name = call["name"]
+                                                args = json.dumps(call.get("arguments", {}))
+                                            yield f"\n[Tool Call] {name}({args})"
+                                    
+                                    # Process tool calls
+                                    results = await self.process_tool_calls(
+                                        tool_calls,
+                                        config.get("mcpServers", {})
+                                    )
+                                    
+                                    # Add tool results to conversation
+                                    conversation.extend(results)
+                                    
+                                    # Yield tool results with better formatting
+                                    for result in results:
+                                        content = json.loads(result["content"])
+                                        if isinstance(content, dict) and "error" in content:
+                                            yield f"\n[Error] {content['error']}"
+                                        else:
+                                            if show_tool_calls:
+                                                yield f"\n[Result] {json.dumps(content, indent=2)}"
+                                            else:
+                                                yield f"\n{json.dumps(content)}"
+                                    
+                                    # Force continuation to get assistant's response to tool results
+                                    break
+                            else:
+                                # If chunk is a string (error message), yield it directly
+                                yield chunk
+                        
+                        # Add final message to conversation if we have content and no tool calls
+                        if current_text and not has_tool_calls:
+                            conversation.append({
+                                "role": "assistant",
+                                "content": "".join(current_text)
+                            })
+                        
+                        # Continue only if we had tool calls
+                        needs_continuation = has_tool_calls
+                        
+                except Exception as e:
+                    error_msg = f"\nError in stream response: {str(e)}"
+                    logger.error(error_msg)
+                    yield error_msg
+                finally:
+                    await log_messages()
+                    
+            return stream_response()
+        
         try:
-            tools = await client.list_tools()
-            self._tool_cache[server_name] = [
-                {
-                    "name": f"{server_name}_{t['name']}",
-                    "description": t.get("description", ""),
-                    "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}
-                } for t in tools
-            ]
-        except Exception as e:
-            logger.error(f"Error fetching tools for {server_name}: {str(e)}")
-            self._tool_cache[server_name] = []
+            final_text = []
+            while True:
+                try:
+                    gen_result = await self.generate_text(conversation, chosen_model, stream=False)
+                    
+                    assistant_text = gen_result["assistant_text"]
+                    tool_calls = gen_result.get("tool_calls", [])
+                    
+                    final_text.append(assistant_text)
+                    
+                    conversation.append({
+                        "role": "assistant",
+                        "content": assistant_text,
+                        **({"tool_calls": tool_calls} if tool_calls else {})
+                    })
+                    
+                    if not tool_calls:
+                        break
 
-    def reset(self):
-        """Reset the state."""
-        self.connection_pool = None
-        self.all_functions = []
-        self._tool_cache = {}
-        self._server_connections = {}
+                    if show_tool_calls:
+                        # Show tool calls being made
+                        for call in tool_calls:
+                            if "function" in call:
+                                name = call["function"]["name"]
+                                args = call["function"].get("arguments", "{}")
+                            else:
+                                name = call["name"]
+                                args = json.dumps(call.get("arguments", {}))
+                            final_text.append(f"\n[Tool Call] {name}({args})")
+                    
+                    results = await self.process_tool_calls(
+                        tool_calls,
+                        config.get("mcpServers", {})
+                    )
+                    conversation.extend(results)
 
-_state = MCPState()
+                    # Add formatted results
+                    for result in results:
+                        content = json.loads(result["content"])
+                        if isinstance(content, dict) and "error" in content:
+                            final_text.append(f"\n[Error] {content['error']}")
+                        else:
+                            if show_tool_calls:
+                                final_text.append(f"\n[Result] {json.dumps(content, indent=2)}")
+                            else:
+                                final_text.append(f"\n{json.dumps(content)}")
+                    
+                except Exception as e:
+                    logger.error(f"Error in non-stream response: {str(e)}")
+                    return f"Error: {str(e)}"
+            
+            return "".join(final_text)
+        finally:
+            await log_messages()
 
-async def initialize_mcp(config: Optional[dict] = None, config_path: str = "mcp_config.json"):
-    """Initialize MCP servers and cache their tool definitions."""
-    if config is None:
-        config = await load_mcp_config_from_file(config_path)
-    
-    return await _state.ensure_initialized(config)
+# Global client instance
+_client = MCPClient()
+
+async def initialize_mcp(config: Optional[dict] = None, config_path: str = "mcp_config.json", quiet_mode: bool = False) -> bool:
+    """Initialize the global MCP client."""
+    return await _client.initialize(config, config_path, quiet_mode)
 
 async def shutdown():
-    """Cleanup the global connection pool when application shuts down."""
-    if _state.connection_pool:
-        await _state.connection_pool.cleanup()
-        _state.reset()
-
-def _select_model(models_cfg: List[Dict], model_name: Optional[str] = None) -> Optional[Dict]:
-    """Helper function to select appropriate model configuration."""
-    if not models_cfg:
-        return None
-        
-    if model_name:
-        # Match either model name or title case-insensitively
-        model_name_lower = model_name.lower()
-        return next((m for m in models_cfg if m.get("model", "").lower() == model_name_lower or m.get("title", "").lower() == model_name_lower),
-                   next((m for m in models_cfg if m.get("default")), models_cfg[0]))
-    
-    return next((m for m in models_cfg if m.get("default")), models_cfg[0])
-
-async def generate_text(conversation: List[Dict], model_cfg: Dict,
-                       all_functions: List[Dict], stream: bool = False) -> Union[Dict, AsyncGenerator]:
-    """Generate text using the specified provider."""
-    provider = model_cfg.get("provider", "").lower()
-    
-    # Map providers to their generation functions
-    provider_map = {
-        "openai": generate_with_openai,
-        "anthropic": generate_with_anthropic,
-        "ollama": generate_with_ollama
-    }
-    
-    if provider not in provider_map:
-        error_result = {"assistant_text": f"Unsupported provider '{provider}'", "tool_calls": []}
-        if stream:
-            async def error_stream():
-                yield error_result
-            return error_stream()
-        return error_result
-    
-    provider_func = provider_map[provider]
-    
-    if stream:
-        if provider == "openai":
-            return await provider_func(conversation, model_cfg, all_functions, stream=True)
-        else:
-            async def wrap_stream():
-                result = await provider_func(conversation, model_cfg, all_functions)
-                yield result
-            return wrap_stream()
-    else:
-        return await provider_func(conversation, model_cfg, all_functions, stream=False)
-
-async def log_messages_to_file(messages: List[Dict], functions: List[Dict], log_path: str):
-    """Log messages and function definitions to a JSONL file."""
-    try:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(json.dumps({"messages": messages, "functions": functions}) + "\n")
-    except Exception as e:
-        logger.error(f"Error logging messages to {log_path}: {str(e)}")
+    """Shutdown the global MCP client."""
+    await _client.shutdown()
 
 async def run_interaction(
     user_query: str,
     model_name: Optional[str] = None,
     config: Optional[dict] = None,
     config_path: str = "mcp_config.json",
-    quite_mode: bool = False,
+    quiet_mode: bool = False,
     log_messages_path: Optional[str] = None,
-    stream: bool = False
+    stream: bool = False,
+    show_tool_calls: bool = False
 ) -> Union[str, AsyncGenerator[Union[str, Dict], None]]:
-    """Run an interaction with the MCP servers."""
+    """
+    Run an interaction using the global MCP client.
     
-    # Load configuration if not provided
-    if config is None:
-        config = await load_mcp_config_from_file(config_path)
-    
-    # Select model
-    chosen_model = _select_model(config.get("models", []), model_name)
-    if not chosen_model:
-        error_msg = "No suitable model found in config."
-        if stream:
-            async def error_stream():
-                yield error_msg
-            return error_stream()
-        return error_msg
-    
-    # Ensure MCP is initialized (now using efficient async initialization)
-    if not await _state.ensure_initialized(config, quite_mode):
-        error_msg = "Failed to initialize MCP servers. No tools were registered."
-        if stream:
-            async def error_stream():
-                yield error_msg
-            return error_stream()
-        return error_msg
-    
-    # Initialize conversation
-    conversation = [
-        {"role": "system", "content": chosen_model.get("systemMessage", "You are a helpful assistant with access to MCP servers. You will carefully examine the query and use MCP servers IF needed to answer the query.")},
-        {"role": "user", "content": user_query}
-    ]
-    
-    # Use singleton stream processor
-    async def cleanup():
-        """Log messages and cleanup if needed"""
-        if log_messages_path:
-            await log_messages_to_file(conversation, _state.all_functions, log_messages_path)
-    
-    if stream:
-        async def stream_response():
-            try:
-                while True:
-                    generator = await generate_text(conversation, chosen_model, _state.all_functions, stream=True)
-                    async for chunk in _state.stream_processor.process_stream(generator, conversation):
-                        yield chunk
-                    
-                    if not conversation[-1].get("tool_calls"):
-                        break
-                    
-                    tool_calls = conversation[-1].get("tool_calls", [])
-                    try:
-                        results = await _state.stream_processor.process_tool_calls(tool_calls, config.get("mcpServers", {}))
-                        conversation.extend(results)
-                    except Exception as e:
-                        logger.error(f"Error processing tool calls: {str(e)}")
-                        yield f"\nError processing tool calls: {str(e)}"
-                        break
-            except Exception as e:
-                logger.error(f"Error in stream response: {str(e)}")
-                yield f"\nError: {str(e)}"
-            finally:
-                await cleanup()
-        return stream_response()
-    
-    try:
-        final_text = ""
-        while True:
-            try:
-                gen_result = await generate_text(conversation, chosen_model, _state.all_functions, stream=False)
-                
-                assistant_text = gen_result["assistant_text"]
-                final_text = assistant_text
-                tool_calls = gen_result.get("tool_calls", [])
-                
-                assistant_message = {
-                    "role": "assistant",
-                    "content": assistant_text,
-                    **({"tool_calls": tool_calls} if tool_calls else {})
-                }
-                conversation.append(assistant_message)
-                
-                if not tool_calls:
-                    break
-                
-                results = await _state.stream_processor.process_tool_calls(tool_calls, config.get("mcpServers", {}))
-                conversation.extend(results)
-            except Exception as e:
-                logger.error(f"Error in non-stream response: {str(e)}")
-                return f"Error: {str(e)}"
-        
-        return final_text
-    finally:
-        await cleanup()
+    Args:
+        user_query: The user's input query
+        model_name: Optional name of the model to use
+        config: Optional configuration dictionary
+        config_path: Path to config file if config not provided
+        quiet_mode: Whether to suppress initialization logs
+        log_messages_path: Optional path to log messages
+        stream: Whether to stream the response
+        show_tool_calls: Whether to show detailed tool calls and results
+    """
+    return await _client.run_interaction(
+        user_query=user_query,
+        model_name=model_name,
+        config=config,
+        config_path=config_path,
+        quiet_mode=quiet_mode,
+        log_messages_path=log_messages_path,
+        stream=stream,
+        show_tool_calls=show_tool_calls
+    )

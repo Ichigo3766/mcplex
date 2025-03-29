@@ -4,24 +4,81 @@ OpenAI provider implementation for Dolphin MCP.
 
 import os
 import json
-from typing import Dict, List, Any, AsyncGenerator, Optional, Union
+import asyncio
+import logging
+from typing import Dict, List, Any, AsyncGenerator, Optional, Union, Callable, TypeVar
 from openai import AsyncOpenAI, APIError, RateLimitError
+
+logger = logging.getLogger("mcplex")
+
+T = TypeVar('T')
+
+async def retry_with_exponential_backoff(
+    operation: Callable[..., T],
+    max_retries: int = 5,
+    initial_delay: float = 1,
+    max_delay: float = 60,
+    exponential_base: float = 2,
+    *args,
+    **kwargs
+) -> T:
+    """
+    Retry an async operation with exponential backoff.
+    
+    Args:
+        operation: The async function to retry
+        max_retries: Maximum number of retries
+        initial_delay: Initial delay between retries in seconds
+        max_delay: Maximum delay between retries in seconds
+        exponential_base: Base for exponential backoff
+        *args, **kwargs: Arguments to pass to the operation
+    """
+    delay = initial_delay
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            return await operation(*args, **kwargs)
+        except RateLimitError as e:
+            last_exception = e
+            retry_after = float(e.headers.get('retry-after', delay)) if hasattr(e, 'headers') else delay
+            delay = min(max_delay, retry_after)
+            logger.warning(f"Rate limit hit, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
+        except APIError as e:
+            last_exception = e
+            if not e.should_retry():
+                raise
+            delay = min(max_delay, delay * exponential_base)
+            logger.warning(f"API error, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
+        except Exception as e:
+            last_exception = e
+            if "overloaded" not in str(e).lower() and "timeout" not in str(e).lower():
+                raise
+            delay = min(max_delay, delay * exponential_base)
+            logger.warning(f"Server error, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
+            
+        await asyncio.sleep(delay)
+    
+    raise last_exception
 
 async def generate_with_openai_stream(client: AsyncOpenAI, model_name: str, conversation: List[Dict],
                                     formatted_functions: List[Dict], temperature: Optional[float] = None,
                                     top_p: Optional[float] = None, max_tokens: Optional[int] = None) -> AsyncGenerator:
     """Internal function for streaming generation"""    
     try:
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=conversation,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            tools=[{"type": "function", "function": f} for f in formatted_functions],
-            tool_choice="auto",
-            stream=True
-        )
+        async def create_stream():
+            return await client.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                tools=[{"type": "function", "function": f} for f in formatted_functions],
+                tool_choice="auto",
+                stream=True
+            )
+            
+        response = await retry_with_exponential_backoff(create_stream)
 
         current_tool_calls = []
         current_content = ""
@@ -107,16 +164,19 @@ async def generate_with_openai_sync(client: AsyncOpenAI, model_name: str, conver
                                   top_p: Optional[float] = None, max_tokens: Optional[int] = None) -> Dict:
     """Internal function for non-streaming generation"""
     try:
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=conversation,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            tools=[{"type": "function", "function": f} for f in formatted_functions],
-            tool_choice="auto",
-            stream=False
-        )
+        async def create_completion():
+            return await client.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                tools=[{"type": "function", "function": f} for f in formatted_functions],
+                tool_choice="auto",
+                stream=False
+            )
+            
+        response = await retry_with_exponential_backoff(create_completion)
 
         choice = response.choices[0]
         assistant_text = choice.message.content or ""

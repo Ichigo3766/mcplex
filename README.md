@@ -216,7 +216,8 @@ async def main():
       user_query="Hello",
       model_name="gpt-4o",  # Can use either model name ("gpt-4o") or title ("GPT-4")
       config_path="mcp_config.json",
-      quiet_mode=False,
+      quiet_mode=False, #for logger messages
+      show_tool_calls=True, #shows tool calls arguements and results to client
       stream=False
    )
    print(result)
@@ -226,8 +227,9 @@ async def main():
       user_query="Hello",
       model_name="gpt-4o",
       stream=True,
-      config_path=mcp_config.json,
-      quiet_mode=False,
+      config_path="mcp_config.json",
+      quiet_mode=False, #for logger messages
+      show_tool_calls=True, #shows tool calls arguements and results to client
    ):
       print(chunk, end="", Flush=True)
 
