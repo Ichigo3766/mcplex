@@ -178,7 +178,7 @@ The project uses two main configuration files:
    - `command`: Command to start the MCP server
    - `args`: Command-line arguments for the server
    - `env`: Environment variables for the server
-   - `timeout`: Maximum time to wait for server responses (in seconds, default: 3600.0)
+   - `timeout`: Maximum time to wait for server responses (in seconds, default: 60)
    - `disabled`: Optional boolean flag to disable a server without removing its configuration
 
 ## Usage
