@@ -241,18 +241,28 @@ asyncio.run(main())
 ### Package Structure
 
 ```
-mcplex/
-├── __init__.py
-├── client.py          # Core client implementation
-├── mcp_client.py      # MCP server client
-├── connection_pool.py # Connection management with caching
-├── stream_processor.py # Enhanced streaming support
-├── cli.py            # Command-line interface
-├── utils.py          # Utility functions
-└── providers/        # Model providers
-    ├── openai.py
-    ├── anthropic.py
-    └── ollama.py
+Directory structure:
+└── ichigo3766-mcplex/
+    ├── README.md
+    ├── mcp_config.json
+    ├── pyproject.toml
+    ├── requirements.txt
+    ├── .env.example
+    └── src/
+        └── mcplex/
+            ├── __init__.py
+            ├── cli.py
+            ├── client.py
+            ├── mcp_errors.py
+            ├── mcp_manager.py
+            ├── mcp_types.py
+            ├── utils.py
+            └── providers/
+                ├── __init__.py
+                ├── anthropic.py
+                ├── ollama.py
+                └── openai.py
+
 ```
 
 ### Key Components

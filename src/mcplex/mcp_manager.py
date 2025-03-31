@@ -12,6 +12,11 @@ from .mcp_errors import ErrorManager, MCPError
 
 logger = logging.getLogger("mcplex")
 
+# Maximum number of retries for operations
+MAX_RETRIES = 3
+# Delay between retries in seconds
+RETRY_DELAY = 1
+
 class MCPManager:
     """Unified manager for MCP operations."""
     
@@ -183,7 +188,9 @@ class MCPManager:
         await self._message_queues[server_name].put(notification)
 
     async def _process_messages(self, server_name: str) -> None:
-        """Process outgoing messages for a server."""
+        """Process outgoing messages for a server with retry logic."""
+        retry_count = 0
+        
         while True:
             try:
                 if server_name not in self._connections:
@@ -193,20 +200,39 @@ class MCPManager:
                 connection = self._connections[server_name]
                 
                 if not connection.process or connection.process.stdin.is_closing():
+                    if retry_count < MAX_RETRIES:
+                        retry_count += 1
+                        logger.warning(f"Connection issue with {server_name}, attempt {retry_count}/{MAX_RETRIES}")
+                        await asyncio.sleep(RETRY_DELAY)
+                        # Try to reconnect
+                        if await self._reconnect_server(server_name):
+                            connection = self._connections[server_name]
+                            continue
                     break
 
                 try:
                     data = json.dumps(message) + "\n"
                     connection.process.stdin.write(data.encode())
                     await connection.process.stdin.drain()
+                    retry_count = 0  # Reset retry count on successful send
                 except Exception as e:
                     logger.error(f"Error sending message to {server_name}: {str(e)}")
+                    if retry_count < MAX_RETRIES:
+                        retry_count += 1
+                        logger.warning(f"Retrying message send, attempt {retry_count}/{MAX_RETRIES}")
+                        await asyncio.sleep(RETRY_DELAY)
+                        continue
                     break
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in message processing for {server_name}: {str(e)}")
+                if retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    logger.warning(f"Retrying after error, attempt {retry_count}/{MAX_RETRIES}")
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
                 break
 
     async def _receive_messages(self, server_name: str) -> None:
@@ -324,31 +350,94 @@ class MCPManager:
                 logger.error(f"Error monitoring stderr for {server_name}: {str(e)}")
                 break
 
-    async def call_tool(self, server_name: str, tool_name: str, arguments: Dict) -> Dict:
-        """Call a tool on a specific server."""
+    async def check_connection(self, server_name: str) -> bool:
+        """Check if a server connection is healthy."""
         if server_name not in self._connections:
-            raise MCPError(f"Server {server_name} not connected")
+            return False
+        connection = self._connections[server_name]
+        return (connection.process and
+                not connection.process.stdout.at_eof() and
+                not connection.process.stdin.is_closing())
 
-        self._request_id += 1
-        req_id = self._request_id
+    async def _reconnect_server(self, server_name: str) -> bool:
+        """Attempt to reconnect to a server."""
+        try:
+            if server_name not in self._connections:
+                return False
+            
+            connection = self._connections[server_name]
+            await self._cleanup_server(server_name)
+            
+            # Reinitialize with the same config
+            return await self.initialize_server(connection.config)
+            
+        except Exception as e:
+            logger.error(f"Failed to reconnect to {server_name}: {str(e)}")
+            return False
 
-        result = await self._send_request(
-            server_name,
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": arguments
-                }
-            }
-        )
+    async def call_tool(self, server_name: str, tool_name: str, arguments: Dict) -> Dict:
+        """Call a tool on a specific server with connection checks and retries."""
+        retry_count = 0
+        
+        while True:
+            try:
+                if not await self.check_connection(server_name):
+                    if retry_count < MAX_RETRIES:
+                        retry_count += 1
+                        logger.warning(f"Server {server_name} connection unhealthy, attempting reconnect {retry_count}/{MAX_RETRIES}")
+                        if await self._reconnect_server(server_name):
+                            logger.info(f"Successfully reconnected to {server_name}")
+                            continue
+                        await asyncio.sleep(RETRY_DELAY)
+                    raise MCPError(f"Server {server_name} disconnected and reconnection failed")
 
-        if not result:
-            raise MCPError(f"Tool call failed: {tool_name}")
+                self._request_id += 1
+                req_id = self._request_id
 
-        return result
+                # Send request with timeout based on tool complexity
+                result = await self._send_request(
+                    server_name,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_name,
+                            "arguments": arguments
+                        }
+                    },
+                    timeout=self._connections[server_name].config.timeout * 2
+                )
+
+                if not result:
+                    if retry_count < MAX_RETRIES:
+                        retry_count += 1
+                        logger.warning(f"Tool call failed, retrying {retry_count}/{MAX_RETRIES}")
+                        # Exponential backoff
+                        await asyncio.sleep(RETRY_DELAY * (2 ** (retry_count - 1)))
+                        continue
+                    raise MCPError(f"Tool call failed after {MAX_RETRIES} retries: {tool_name}")
+
+                # Validate response
+                if isinstance(result, dict) and "error" in result:
+                    raise MCPError(f"Tool returned error: {result['error']}")
+
+                return result
+
+            except asyncio.TimeoutError:
+                if retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    logger.warning(f"Tool call timed out, retrying {retry_count}/{MAX_RETRIES}")
+                    await asyncio.sleep(RETRY_DELAY * (2 ** (retry_count - 1)))
+                    continue
+                raise MCPError(f"Tool call timed out after {MAX_RETRIES} retries: {tool_name}")
+            except Exception as e:
+                if retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    logger.warning(f"Error in tool call, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
+                    await asyncio.sleep(RETRY_DELAY * (2 ** (retry_count - 1)))
+                    continue
+                raise MCPError(f"Tool call failed: {str(e)}")
 
     async def _cleanup_server(self, server_name: str) -> None:
         """Clean up resources for a server."""
