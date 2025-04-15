@@ -46,7 +46,8 @@ async def retry_with_exponential_backoff(
             logger.warning(f"Rate limit hit, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
         except APIError as e:
             last_exception = e
-            if not e.should_retry():
+            # Safely check if the error has a should_retry method before calling it
+            if not hasattr(e, 'should_retry') or not e.should_retry():
                 raise
             delay = min(max_delay, delay * exponential_base)
             logger.warning(f"API error, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
@@ -206,8 +207,8 @@ async def generate_with_openai_sync(client: AsyncOpenAI, model_name: str, conver
     except Exception as e:
         return {"assistant_text": f"Unexpected OpenAI error: {str(e)}", "tool_calls": []}
 
-async def generate_with_openai(conversation: List[Dict], model_cfg: Dict, 
-                             all_functions: List[Dict], stream: bool = False) -> Union[Dict, AsyncGenerator]:
+async def generate_with_openai(conversation: List[Dict], model_cfg: Dict,
+                              all_functions: List[Dict], stream: bool = False) -> Union[Dict, AsyncGenerator]:
     """
     Generate text using OpenAI's API.
     
@@ -237,23 +238,87 @@ async def generate_with_openai(conversation: List[Dict], model_cfg: Dict,
     top_p = model_cfg.get("top_p", None)
     max_tokens = model_cfg.get("max_tokens", None)
 
+    # Create a mapping from original to sanitized names
+    name_mapping = {}
+    
     # Format functions for OpenAI API
     formatted_functions = []
     for func in all_functions:
+        # Sanitize function name to ensure it matches API requirements
+        # Replace any characters that might not match the regex pattern with underscores
+        # Ensure the name only contains alphanumeric characters, underscores, and hyphens
+        original_name = func["name"]
+        sanitized_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in original_name)
+        
+        # Store the mapping
+        name_mapping[original_name] = sanitized_name
+        
         formatted_func = {
-            "name": func["name"],
-            "description": func["description"],
+            "name": sanitized_name,
+            "description": f"{original_name} - {func['description']}",  # Include original name in description
             "parameters": func["parameters"]
         }
         formatted_functions.append(formatted_func)
+    
+    # Sanitize tool names in conversation history
+    sanitized_conversation = []
+    for message in conversation:
+        sanitized_message = message.copy()
+        
+        # Check if the message has tool_calls
+        if "tool_calls" in message:
+            sanitized_tool_calls = []
+            for tool_call in message["tool_calls"]:
+                sanitized_tool_call = tool_call.copy()
+                
+                # Sanitize function name if present
+                if "function" in tool_call:
+                    sanitized_function = tool_call["function"].copy()
+                    if "name" in sanitized_function:
+                        original_name = sanitized_function["name"]
+                        if original_name in name_mapping:
+                            sanitized_function["name"] = name_mapping[original_name]
+                        else:
+                            # If not in mapping, sanitize directly
+                            sanitized_function["name"] = ''.join(c if c.isalnum() or c in '_-' else '_' for c in original_name)
+                    sanitized_tool_call["function"] = sanitized_function
+                
+                sanitized_tool_calls.append(sanitized_tool_call)
+            
+            sanitized_message["tool_calls"] = sanitized_tool_calls
+        
+        # Check for content that might contain tool use
+        if "content" in message and isinstance(message["content"], list):
+            sanitized_content = []
+            for content_item in message["content"]:
+                if isinstance(content_item, dict) and "toolUse" in content_item:
+                    sanitized_item = content_item.copy()
+                    tool_use = content_item["toolUse"].copy()
+                    
+                    if "name" in tool_use:
+                        original_name = tool_use["name"]
+                        if original_name in name_mapping:
+                            tool_use["name"] = name_mapping[original_name]
+                        else:
+                            # If not in mapping, sanitize directly
+                            tool_use["name"] = ''.join(c if c.isalnum() or c in '_-' else '_' for c in original_name)
+                    
+                    sanitized_item["toolUse"] = tool_use
+                    sanitized_content.append(sanitized_item)
+                else:
+                    sanitized_content.append(content_item)
+            
+            sanitized_message["content"] = sanitized_content
+        
+        sanitized_conversation.append(sanitized_message)
 
     if stream:
         return generate_with_openai_stream(
-            client, model_name, conversation, formatted_functions,
+            client, model_name, sanitized_conversation, formatted_functions,
             temperature, top_p, max_tokens
         )
     else:
         return await generate_with_openai_sync(
-            client, model_name, conversation, formatted_functions,
+            client, model_name, sanitized_conversation, formatted_functions,
             temperature, top_p, max_tokens
         )

@@ -30,6 +30,7 @@ class MCPClient:
         self.manager = MCPManager()
         self._initialized = False
         self._lock = asyncio.Lock()
+        self.sanitized_name_map = {}  # Initialize the sanitized name map
 
     async def initialize(self, config: Optional[Dict] = None, config_path: str = "mcp_config.json", quiet_mode: bool = False) -> bool:
         """Initialize MCP with configuration."""
@@ -135,8 +136,17 @@ class MCPClient:
         
         provider_func = provider_map[provider]
         
-        # Convert ToolDefinition objects to dictionaries
-        tools = [tool.to_dict() for tool in self.manager.all_tools]
+        # Convert ToolDefinition objects to dictionaries and create a mapping for sanitized names
+        tools = []
+        self.sanitized_name_map = {}
+        
+        for tool in self.manager.all_tools:
+            tool_dict = tool.to_dict()
+            # Create the same sanitized name as in openai.py
+            sanitized_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in tool_dict["name"])
+            # Store mapping from sanitized name to original name
+            self.sanitized_name_map[sanitized_name] = tool_dict["name"]
+            tools.append(tool_dict)
         
         if stream:
             if provider == "openai":
@@ -160,17 +170,23 @@ class MCPClient:
                     # Handle both function_call and tool_calls format
                     if "function" in call:
                         # OpenAI format
-                        name = call["function"]["name"]
+                        sanitized_name = call["function"]["name"]
                         arguments = json.loads(call["function"].get("arguments", "{}"))
                         call_id = call.get("id", "")
                     elif "name" in call:
                         # Direct format
-                        name = call["name"]
+                        sanitized_name = call["name"]
                         arguments = call.get("arguments", {})
                         call_id = call.get("id", "")
                     else:
                         raise MCPError("Invalid tool call format")
 
+                    # Map sanitized name back to original name
+                    if hasattr(self, 'sanitized_name_map') and sanitized_name in self.sanitized_name_map:
+                        name = self.sanitized_name_map[sanitized_name]
+                    else:
+                        name = sanitized_name
+                        
                     name_parts = name.split("_", 1)
                     if len(name_parts) != 2:
                         raise MCPError(f"Invalid tool name format: {name}")
@@ -333,12 +349,19 @@ class MCPClient:
                                     if show_tool_calls:
                                         for call in tool_calls:
                                             if "function" in call:
-                                                name = call["function"]["name"]
+                                                sanitized_name = call["function"]["name"]
                                                 args = call["function"].get("arguments", "{}")
                                             else:
-                                                name = call["name"]
+                                                sanitized_name = call["name"]
                                                 args = json.dumps(call.get("arguments", {}))
-                                            yield f"\n[Tool Call] {name}({args})"
+                                                
+                                            # Map sanitized name back to original name for display
+                                            if hasattr(self, 'sanitized_name_map') and sanitized_name in self.sanitized_name_map:
+                                                display_name = self.sanitized_name_map[sanitized_name]
+                                            else:
+                                                display_name = sanitized_name
+                                                
+                                            yield f"\n[Tool Call] {display_name}({args})"
                                     
                                     # Process tool calls and wait for results
                                     results = await self.process_tool_calls(
@@ -411,12 +434,19 @@ class MCPClient:
                         # Show tool calls being made
                         for call in tool_calls:
                             if "function" in call:
-                                name = call["function"]["name"]
+                                sanitized_name = call["function"]["name"]
                                 args = call["function"].get("arguments", "{}")
                             else:
-                                name = call["name"]
+                                sanitized_name = call["name"]
                                 args = json.dumps(call.get("arguments", {}))
-                            final_text.append(f"\n[Tool Call] {name}({args})")
+                                
+                            # Map sanitized name back to original name for display
+                            if hasattr(self, 'sanitized_name_map') and sanitized_name in self.sanitized_name_map:
+                                display_name = self.sanitized_name_map[sanitized_name]
+                            else:
+                                display_name = sanitized_name
+                                
+                            final_text.append(f"\n[Tool Call] {display_name}({args})")
                     
                     results = await self.process_tool_calls(
                         tool_calls,
